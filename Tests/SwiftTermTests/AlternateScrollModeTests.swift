@@ -209,6 +209,83 @@ final class AlternateScrollModeTests: TerminalDelegate {
         #expect(delegate.sent.count == WheelReportBudget.burst)
     }
 
+    /// With a discrete multiplier a notch carries a distance, as in Ghostty: a notch of
+    /// three lines becomes three reports instead of one.
+    @MainActor @Test func discreteMultiplierTurnsANotchIntoThatManyReports() async {
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
+        let delegate = WheelCapturingDelegate()
+        view.terminalDelegate = delegate
+        view.discreteScrollMultiplier = 3
+        view.terminal.feed(text: "\u{1b}[?1000h")
+        guard let wheel = Self.makeWheelEvent(lines: -1) else {
+            Issue.record("could not synthesize a scroll wheel event")
+            return
+        }
+
+        view.scrollWheel(with: wheel)
+        await drainMainQueue()
+
+        #expect(delegate.sent.count == 3)
+    }
+
+    /// The multiplier applies to the cursor keys sent in place of the wheel as well.
+    @MainActor @Test func discreteMultiplierScalesTheCursorKeysOnTheAlternateScreen() {
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
+        let delegate = WheelCapturingDelegate()
+        view.terminalDelegate = delegate
+        view.discreteScrollMultiplier = 3
+        view.terminal.feed(text: "\u{1b}[?1049h")
+        guard let wheel = Self.makeWheelEvent(lines: -1) else {
+            Issue.record("could not synthesize a scroll wheel event")
+            return
+        }
+
+        view.scrollWheel(with: wheel)
+
+        #expect(delegate.sent == Array(repeating: Array(EscapeSequences.moveDownNormal), count: 3))
+    }
+
+    /// The multiplier moves the scrollback by that many lines a notch.
+    @MainActor @Test func discreteMultiplierScalesLocalScrolling() {
+        let view = TerminalView(
+            frame: CGRect(x: 0, y: 0, width: 320, height: 160),
+            font: nil,
+            options: TerminalOptions(cols: 40, rows: 5, scrollback: 100))
+        view.discreteScrollMultiplier = 3
+        for index in 1...20 {
+            view.terminal.feed(text: "line-\(index)\r\n")
+        }
+        let before = view.terminal.displayBuffer.yDisp
+        guard let wheel = Self.makeWheelEvent(lines: 1) else {
+            Issue.record("could not synthesize a scroll wheel event")
+            return
+        }
+
+        view.scrollWheel(with: wheel)
+
+        #expect(view.terminal.displayBuffer.yDisp == before - 3)
+    }
+
+    /// Without the limit a flick sends every line it travelled, as Ghostty does.
+    @MainActor @Test func unlimitedWheelReportsSendEveryLineOfAFlick() async {
+        let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))
+        let delegate = WheelCapturingDelegate()
+        view.terminalDelegate = delegate
+        view.limitsWheelReports = false
+        view.terminal.feed(text: "\u{1b}[?1000h")
+        guard let cellHeight = view.cellDimension?.height,
+              let wheel = Self.makePreciseWheelEvent(
+                pixels: Int32((cellHeight * 40).rounded())) else {
+            Issue.record("could not synthesize a precise scroll wheel event")
+            return
+        }
+
+        view.scrollWheel(with: wheel)
+        await drainMainQueue()
+
+        #expect(delegate.sent.count == 40)
+    }
+
     /// Cursor keys are not notches: an accelerated classic event keeps its line count.
     @MainActor @Test func classicWheelEventOnTheAlternateScreenKeepsItsLineCount() {
         let view = TerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 160))

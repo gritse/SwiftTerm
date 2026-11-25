@@ -1924,8 +1924,40 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         // cycle that re-evaluates cursor rects. With a customized pointer (size or
         // colour in Accessibility settings) each set() re-renders the cursor image,
         // so setting the cursor that is already current is expensive. Skip it.
-        if NSCursor.current != NSCursor.iBeam {
-            NSCursor.iBeam.set ()
+        let pointer = self.pointer
+        if NSCursor.current != pointer {
+            pointer.set ()
+        }
+    }
+
+    /// When true, the pointer is an arrow instead of the I-beam while the application
+    /// receives mouse reports, as in Ghostty, so it does not suggest that a drag selects
+    /// text. Holding Shift, which hands the mouse back to selection, shows the I-beam.
+    /// Defaults to false: the pointer is always the I-beam.
+    public var pointsWithArrowWhileReportingMouse: Bool = false {
+        didSet { updatePointer() }
+    }
+
+    /// The pointer for the current mouse mode and modifier keys.
+    var pointer: NSCursor {
+        guard pointsWithArrowWhileReportingMouse, allowMouseReporting, currentMouseMode != .off else {
+            return .iBeam
+        }
+        let shiftSelects = NSEvent.modifierFlags.contains(.shift)
+            && !withTerminal { $0.mouseShiftCapture }
+        return shiftSelects ? .iBeam : .arrow
+    }
+
+    /// Shows the pointer for the current state at once when the mouse is over the view,
+    /// rather than at the next mouse move.
+    func updatePointer () {
+        guard let window else { return }
+        window.invalidateCursorRects(for: self)
+        let location = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard bounds.contains(location) else { return }
+        let pointer = self.pointer
+        if NSCursor.current != pointer {
+            pointer.set ()
         }
     }
     
@@ -2167,6 +2199,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     // when the Command key is pressed.
     
     public override func flagsChanged(with event: NSEvent) {
+        if pointsWithArrowWhileReportingMouse {
+            updatePointer()
+        }
         if event.modifierFlags.contains(.command){
             commandActive = true
             startTracking()
@@ -4655,6 +4690,28 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         didSet { scrollSensitivity = max(0.05, scrollSensitivity) }
     }
 
+    /// How far a notch of a mouse wheel (a scroll event without precise deltas) goes, as a
+    /// multiple of the lines AppKit reports for it, counting at least one.
+    ///
+    /// `nil`, the default, keeps the classic behaviour: the scrollback moves by the reported
+    /// lines times `scrollSensitivity`, and an application that receives mouse reports gets
+    /// one report per notch. Once set, a notch is that many lines on every route, reports
+    /// included, and `scrollSensitivity` applies to precise (trackpad) scrolling only. This
+    /// is how Ghostty's `mouse-scroll-multiplier` treats discrete devices.
+    public var discreteScrollMultiplier: CGFloat? = nil {
+        didSet {
+            if let value = discreteScrollMultiplier {
+                discreteScrollMultiplier = max(0.01, value)
+            }
+        }
+    }
+
+    /// Whether wheel reports to the application, and the cursor keys Alternate Scroll Mode
+    /// sends in their place, are held to a small burst per event and about a hundred a
+    /// second, so a fast gesture cannot flood a slow application. Defaults to true. When
+    /// false, every line of a gesture is sent, as Ghostty does.
+    public var limitsWheelReports: Bool = true
+
     private static let logsMouseInput =
         ProcessInfo.processInfo.environment["SWIFTTERM_MOUSE_LOG"] == "1"
 
@@ -4707,6 +4764,11 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 distance: scaledDelta,
                 cellHeight: cellHeight,
                 route: scrollRoute)
+        } else if let discreteScrollMultiplier {
+            scrollAccumulator.reset()
+            let notch = max(abs(event.scrollingDeltaY), 1) * discreteScrollMultiplier
+            let magnitude = max(1, Int(notch.rounded()))
+            lines = event.scrollingDeltaY > 0 ? magnitude : -magnitude
         } else {
             scrollAccumulator.reset()
             // A non-precise wheel notch must always move at least one line, even
@@ -4749,10 +4811,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
                 let buttonFlags = terminal.encodeButton(button: button, release: false,
                                                         shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
-                let wantedReports = WheelReportBudget.requestedReports(
-                    lineCount: lines,
-                    isPrecise: event.hasPreciseScrollingDeltas)
-                let reports = wheelReportBudget.grant(wantedReports)
+                // A notch with a multiplier carries its own distance, the way a trackpad
+                // movement does.
+                let carriesDistance = event.hasPreciseScrollingDeltas || discreteScrollMultiplier != nil
+                let reports = limitsWheelReports
+                    ? wheelReportBudget.grant(WheelReportBudget.requestedReports(
+                        lineCount: lines,
+                        isPrecise: carriesDistance))
+                    : magnitude
                 for _ in 0..<reports {
                     terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow,
                                        pixelX: hit.pixels.col, pixelY: hit.pixels.row)
@@ -4768,8 +4834,9 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             }
             // A full-screen application executes each arrow key on its own, so a flick that
             // banked a hundred lines must not become a hundred keystrokes in one event.
-            let keys = wheelReportBudget.grant(
-                WheelReportBudget.requestedKeys(lineCount: lines))
+            let keys = limitsWheelReports
+                ? wheelReportBudget.grant(WheelReportBudget.requestedKeys(lineCount: lines))
+                : magnitude
             for _ in 0..<keys {
                 if scrollingUp {
                     sendKeyUp()
@@ -4795,7 +4862,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
     
     public override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .iBeam)
+        addCursorRect(bounds, cursor: pointer)
     }
     
     public func resetFontSize ()
@@ -4933,6 +5000,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             } else {
                 deregisterTrackingInterest()
             }
+            updatePointer()
         case .bell:
             deliverBell()
         case .programStatusChanged:
