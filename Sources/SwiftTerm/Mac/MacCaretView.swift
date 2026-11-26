@@ -103,6 +103,7 @@ class CaretView: NSView {
     }
     
     func updateAnimation (to: Bool) {
+        cancelBlinkResume()
         layer?.removeAllAnimations()
         self.layer?.opacity = 1
         if to {
@@ -121,32 +122,52 @@ class CaretView: NSView {
     }
 
     func disableAnimations () {
+        cancelBlinkResume()
         layer?.removeAllAnimations()
         layer?.opacity = 1
     }
 
-    /// Makes the cursor visible now and delays the next blink cycle. Repeated
-    /// input therefore keeps the cursor visible until typing pauses.
+    /// How long the cursor stays steady after the last key before it blinks again.
+    static let blinkResumeDelay: TimeInterval = 0.7
+
+    /// Puts the blink animation back once typing pauses; see `resetBlinkAfterInput`.
+    private(set) var blinkResumeTimer: Timer?
+
+    /// Makes the cursor visible now and keeps it visible until typing pauses,
+    /// then lets it blink again.
+    ///
+    /// The animation is removed on the first key of a burst and added back
+    /// once, `blinkResumeDelay` after the last key; the keys in between only
+    /// move the timer. Replacing the animation on every key, as this used to,
+    /// makes a fullscreen window reach the screen only a few times a second,
+    /// so typed text shows up late and several characters at a time.
     func resetBlinkAfterInput () {
         let canBlink = !tracksFocus || (terminal?.hasFocus ?? true)
         guard canBlink else { return }
         switch style {
         case .blinkUnderline, .blinkBlock, .blinkBar:
-            layer?.removeAllAnimations()
-            layer?.opacity = 1
-            guard let layer else { return }
-            let anim = CABasicAnimation(keyPath: #keyPath(CALayer.opacity))
-            anim.duration = 0.7
-            anim.beginTime = layer.convertTime(CACurrentMediaTime(), from: nil) + 0.7
-            anim.autoreverses = true
-            anim.repeatCount = .infinity
-            anim.fromValue = 1
-            anim.toValue = 0
-            anim.timingFunction = CAMediaTimingFunction(name: .easeIn)
-            layer.add(anim, forKey: #keyPath(CALayer.opacity))
+            if blinkResumeTimer == nil {
+                layer?.removeAllAnimations()
+                layer?.opacity = 1
+            }
+            blinkResumeTimer?.invalidate()
+            let timer = Timer(timeInterval: Self.blinkResumeDelay, repeats: false) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.blinkResumeTimer = nil
+                    self.updateCursorStyle()
+                }
+            }
+            blinkResumeTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
         case .steadyBar, .steadyBlock, .steadyUnderline:
             break
         }
+    }
+
+    private func cancelBlinkResume () {
+        blinkResumeTimer?.invalidate()
+        blinkResumeTimer = nil
     }
     
     public var defaultCaretColor = NSColor.selectedControlColor
